@@ -1,7 +1,12 @@
 """
 Standalone background reminder sender.
-Checks memories.json every 5 minutes and sends email when task time is reached.
-Run this in a separate terminal / process / as a service.
+Checks PostgreSQL database every minute and sends email when reminder is due.
+Uses SQLAlchemy to query the database directly.
+
+Run this in a separate terminal / process / as a service:
+python send_reminders.py
+
+Optional: simulate a future time for testing:
 python send_reminders.py "2026-03-03 08:23:00"
 """
 
@@ -14,25 +19,26 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-# ------------------------------------------------------
-import datetime
+# Set up fake datetime if provided
 import sys
-
-class OffsetDateTime(datetime.datetime):
-    _offset = datetime.timedelta(0)
+class OffsetDateTime(datetime):
+    _offset = timedelta(0)
     @classmethod
     def now(cls, tz=None):
         return super().now(tz) + cls._offset
 
-datetime.datetime = OffsetDateTime
+datetime = OffsetDateTime
 
 if len(sys.argv) > 1:
-    fake = datetime.datetime.fromisoformat(sys.argv[1].replace(" ", "T"))
-    OffsetDateTime._offset = fake - datetime.datetime.now()
-# ------------------------------------------------------
+    fake = OffsetDateTime.fromisoformat(sys.argv[1].replace(" ", "T"))
+    OffsetDateTime._offset = fake - OffsetDateTime.now()
 
 load_dotenv()
+
+# Database imports
+from database import get_session, ReminderDB, TaskDB, MedicationDB
 
 # ──────────────────────────────────────────────
 #           CONFIGURATION (from .env)
@@ -44,290 +50,153 @@ RECIPIENT_EMAIL = os.getenv("REMINDER_RECIPIENT_EMAIL")       # who receives rem
 SMTP_SERVER     = "smtp.gmail.com"
 SMTP_PORT       = 465
 
-# Where your tasks are stored
-NAMESPACE   = "('2', 'memories')"   # must match your agent.py  
-MEMORY_FILE = Path("/workspaces/mini_proj/data/memories.json")  # adjust if needed
-
-CHECK_INTERVAL_SECONDS = 60   # 1 minutes
-GRACE_PERIOD_MINUTES   = 15    # consider task "due" up to 15 min in future too
+USER_ID = "2"  # The user ID to send reminders for
+CHECK_INTERVAL_SECONDS = 60   # Check every 1 minute
+GRACE_PERIOD_MINUTES   = 15    # consider reminder "due" up to 15 min in future too
 
 # ──────────────────────────────────────────────
 
-def load_tasks():
-    """Read tasks from memories.json"""
-    if not MEMORY_FILE.is_file():
-        print(f"Memory file not found: {MEMORY_FILE}")
-        return []
 
-    try:
-        with open(MEMORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get(NAMESPACE, [])
-    except Exception as e:
-        print(f"Error reading {MEMORY_FILE}: {e}")
-        return []
-
-
-def load_medications():
-    """Read medications from memories.json"""
-    if not MEMORY_FILE.is_file():
-        return []
-
-    try:
-        with open(MEMORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("medications", [])
-    except Exception as e:
-        print(f"Error reading medications: {e}")
-        return []
-
-
-def save_tasks(tasks):
-    """Write updated tasks back (with sent flag)"""
-    try:
-        with open(MEMORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        
-        data[NAMESPACE] = tasks
-        
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-            
-        print("Updated sent flags in memories.json")
-    except Exception as e:
-        print(f"Error saving tasks: {e}")
-
-
-def save_medications(medications):
-    """Write updated medications back (with sent flag)"""
-    try:
-        with open(MEMORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        
-        data["medications"] = medications
-        
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-            
-        print("Updated medication reminder flags in memories.json")
-    except Exception as e:
-        print(f"Error saving medications: {e}")
-
-
-def send_email(subject: str, body: str):
-    """Send plain text email via SMTP"""
-    if not all([SENDER_EMAIL, APP_PASSWORD, RECIPIENT_EMAIL]):
-        print("Missing email credentials → cannot send")
+def send_email(subject: str, body: str) -> bool:
+    """Send an email reminder."""
+    if not SENDER_EMAIL or not APP_PASSWORD or not RECIPIENT_EMAIL:
+        print("⚠ Email config missing. Set REMINDER_SENDER_EMAIL, REMINDER_SENDER_APP_PASSWORD, REMINDER_RECIPIENT_EMAIL")
         return False
-
-    msg = MIMEMultipart()
-    msg["From"]    = SENDER_EMAIL
-    msg["To"]      = RECIPIENT_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    context = ssl.create_default_context()
     
     try:
+        context = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
             server.login(SENDER_EMAIL, APP_PASSWORD)
+            
+            # Create message
+            msg = MIMEMultipart()
+            msg["From"] = SENDER_EMAIL
+            msg["To"] = RECIPIENT_EMAIL
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            
+            # Send email
             server.send_message(msg)
-        print(f"Email sent → {RECIPIENT_EMAIL} | {subject}")
-        return True
+            print(f"✓ Email sent to {RECIPIENT_EMAIL}: {subject}")
+            return True
     except Exception as e:
-        print(f"Email send failed: {e}")
+        print(f"✗ Failed to send email: {e}")
         return False
+
+
+def get_pending_reminders_and_medications():
+    """Get pending reminders and medication reminders from PostgreSQL database."""
+    session = get_session()
+    try:
+        now = datetime.now()
+        future = now + timedelta(minutes=GRACE_PERIOD_MINUTES)
+        
+        # Get pending task reminders from database
+        reminders = ReminderDB.get_pending_reminders(session, USER_ID, window_minutes=GRACE_PERIOD_MINUTES)
+        
+        # Get pending tasks (overdue and due soon)
+        all_tasks = TaskDB.get_user_tasks(session, USER_ID, completed=False)
+        pending_tasks = []
+        for task in all_tasks:
+            if task.due_date and task.due_date <= future and task.due_date >= now:
+                pending_tasks.append(task)
+        
+        # Get active medications
+        active_meds = MedicationDB.get_user_medications(session, USER_ID, active=True)
+        
+        return reminders, pending_tasks, active_meds
+    finally:
+        session.close()
 
 
 def process_reminders():
-    """Main check logic — called periodically"""
-    now = datetime.datetime.now()
-    tasks = load_tasks()
-    if not tasks:
-        print(f"{now:%Y-%m-%d %H:%M:%S}  No tasks found.")
-        return
-
-    updated = False
-    sent_count = 0
-
-    for task in tasks:
-        sched_str = task.get("scheduled")
-        if not sched_str:
-            continue
-
-        try:
-            due = datetime.datetime.fromisoformat(sched_str)
-        except:
-            continue
-
-        time_diff_seconds = (due - now).total_seconds()
-        grace_seconds = GRACE_PERIOD_MINUTES * 60
-
-        # Pre-reminder: before due time (within grace period, 0-15 min before)
-        if 0 < time_diff_seconds <= grace_seconds and not task.get("pre_reminder_sent", False):
-            subject = "⏰ Reminder"
-            body = (
-                f"Hello,\n\n"
-                f"→ {task.get('text', '(no description)')}\n"
-                f"   due at {due:%-I:%M %p}\n\n"
-                f"Dementia Assistant\n"
-            )
-            if send_email(subject, body):
-                task["pre_reminder_sent"] = True
-                task["pre_reminder_sent_at"] = datetime.datetime.now().isoformat()
-                updated = True
-                sent_count += 1
-
-        # At-reminder: at/around due time (within 1 minute before/after)
-        elif -60 <= time_diff_seconds <= 0 and not task.get("at_reminder_sent", False):
-            subject = "⏰ Task Time"
-            body = (
-                f"Hello,\n\n"
-                f"→ {task.get('text', '(no description)')}\n"
-                f"   due now at {due:%-I:%M %p}\n\n"
-                f"Dementia Assistant\n"
-            )
-            if send_email(subject, body):
-                task["at_reminder_sent"] = True
-                task["at_reminder_sent_at"] = datetime.datetime.now().isoformat()
-                updated = True
-                sent_count += 1
-
-        # Post-reminder: after due time (1-15 min after)
-        elif -grace_seconds <= time_diff_seconds < -60 and not task.get("post_reminder_sent", False):
-            subject = "🔔 Overdue Reminder"
-            body = (
-                f"Hello,\n\n"
-                f"→ {task.get('text', '(no description)')}\n"
-                f"   was due {due:%-I:%M %p}\n\n"
-                f"Dementia Assistant\n"
-            )
-            if send_email(subject, body):
-                task["post_reminder_sent"] = True
-                task["post_reminder_sent_at"] = datetime.datetime.now().isoformat()
-                updated = True
-                sent_count += 1
-
-    if updated:
-        save_tasks(tasks)
-
-    print(
-        f"{now:%Y-%m-%d %H:%M:%S}  "
-        f"Checked {len(tasks)} tasks → sent {sent_count} reminder(s)"
-    )
-
-
-def process_medication_reminders():
-    """Check medications and send email reminders for scheduled times"""
-    now = datetime.datetime.now()
-    medications = load_medications()
-    if not medications:
-        return
-
-    updated = False
-    sent_count = 0
-    
-    # Get current day of week name
-    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    today = day_names[now.weekday()]
-
-    for med in medications:
-        # Check if medication applies today
-        frequency = med.get("frequency", "daily")
-        med_days = med.get("days", [])
+    """Check and send pending reminders."""
+    session = get_session()
+    try:
+        reminders, pending_tasks, medications = get_pending_reminders_and_medications()
         
-        # Skip if custom frequency and today is not in the list
-        if frequency == "custom" and today not in med_days:
-            continue
+        if not reminders and not pending_tasks and not medications:
+            print(f"[{datetime.now().isoformat()}] No pending reminders")
+            return
         
-        # Process each time for this medication
-        med_times = med.get("times", [])
-        for med_time_str in med_times:
-            try:
-                # Parse HH:MM format
-                med_hour, med_minute = map(int, med_time_str.split(":"))
-                med_datetime = now.replace(hour=med_hour, minute=med_minute, second=0, microsecond=0)
-            except:
-                continue
+        # Process task reminders
+        for reminder in reminders:
+            subject = f"Reminder: {reminder.title}"
+            body = f"Time to: {reminder.title}\n\nScheduled for: {reminder.scheduled_time}"
             
-            time_diff_seconds = (med_datetime - now).total_seconds()
-            grace_seconds = GRACE_PERIOD_MINUTES * 60
+            if reminder.description:
+                body += f"\n\nDetails: {reminder.description}"
             
-            # Create a unique key for this medication + time combination
-            reminder_key = f"{med.get('id')}_{med_time_str}"
+            send_email(subject, body)
             
-            # Pre-reminder: before due time (within grace period, 0-15 min before)
-            if 0 < time_diff_seconds <= grace_seconds and not med.get(f"pre_reminder_{reminder_key}", False):
-                subject = "💊 Medication Reminder"
-                body = (
-                    f"Hello,\n\n"
-                    f"💊 {med.get('name', 'Medication')}\n"
-                    f"   due at {med_hour:02d}:{med_minute:02d}\n\n"
-                    f"Dementia Assistant\n"
+            # Mark as sent
+            ReminderDB.mark_reminder_sent(session, reminder.id)
+        
+        # Process task due dates
+        for task in pending_tasks:
+            subject = f"Task Reminder: {task.text}"
+            body = f"This task is due: {task.text}\n\nDue date: {task.due_date}"
+            
+            if task.description:
+                body += f"\n\nDetails: {task.description}"
+            
+            send_email(subject, body)
+            
+            # Create a reminder record for tracking
+            reminder_id = f"task_{task.id}"
+            existing = ReminderDB.get_reminder(session, reminder_id)
+            if not existing:
+                ReminderDB.create_reminder(
+                    session=session,
+                    user_id=USER_ID,
+                    reminder_id=reminder_id,
+                    title=f"Task: {task.text}",
+                    scheduled_time=task.due_date,
+                    task_id=task.id,
+                    reminder_type="task"
                 )
-                if send_email(subject, body):
-                    med[f"pre_reminder_{reminder_key}"] = True
-                    med[f"pre_reminder_{reminder_key}_at"] = datetime.datetime.now().isoformat()
-                    updated = True
-                    sent_count += 1
-            
-            # At-reminder: at/around due time (within 1 minute before/after)
-            elif -60 <= time_diff_seconds <= 0 and not med.get(f"at_reminder_{reminder_key}", False):
-                subject = "💊 Time for Medication"
-                body = (
-                    f"Hello,\n\n"
-                    f"💊 {med.get('name', 'Medication')}\n"
-                    f"   due now at {med_hour:02d}:{med_minute:02d}\n\n"
-                    f"Dementia Assistant\n"
-                )
-                if send_email(subject, body):
-                    med[f"at_reminder_{reminder_key}"] = True
-                    med[f"at_reminder_{reminder_key}_at"] = datetime.datetime.now().isoformat()
-                    updated = True
-                    sent_count += 1
-            
-            # Post-reminder: after due time (1-15 min after)
-            elif -grace_seconds <= time_diff_seconds < -60 and not med.get(f"post_reminder_{reminder_key}", False):
-                subject = "💊 Overdue Medication"
-                body = (
-                    f"Hello,\n\n"
-                    f"💊 {med.get('name', 'Medication')}\n"
-                    f"   was due at {med_hour:02d}:{med_minute:02d}\n\n"
-                    f"Dementia Assistant\n"
-                )
-                if send_email(subject, body):
-                    med[f"post_reminder_{reminder_key}"] = True
-                    med[f"post_reminder_{reminder_key}_at"] = datetime.datetime.now().isoformat()
-                    updated = True
-                    sent_count += 1
-    
-    if updated:
-        save_medications(medications)
-    
-    print(
-        f"{now:%Y-%m-%d %H:%M:%S}  "
-        f"Checked {len(medications)} medications → sent {sent_count} reminder(s)"
-    )
-
+                ReminderDB.mark_reminder_sent(session, reminder_id)
+        
+        # Process medication reminders
+        for med in medications:
+            if med.frequency == "daily":
+                subject = f"Medication Reminder: {med.name}"
+                body = f"Time to take: {med.name}"
+                
+                if med.dosage:
+                    body += f"\nDosage: {med.dosage}"
+                if med.frequency:
+                    body += f"\nFrequency: {med.frequency}"
+                if med.notes:
+                    body += f"\nNotes: {med.notes}"
+                
+                send_email(subject, body)
+        
+        print(f"✓ Processed {len(reminders)} reminders, {len(pending_tasks)} tasks, {len(medications)} medications")
+    finally:
+        session.close()
 
 
 def main():
-    print("Reminder background service started")
-    print(datetime.datetime.now().strftime("Started at %Y-%m-%d %H:%M:%S"))
-    print(f"  • Memory file:   {MEMORY_FILE}")
-    print(f"  • Recipient:     {RECIPIENT_EMAIL or '(not set)'}")
-    print(f"  • Check every:   {CHECK_INTERVAL_SECONDS // 60} minutes")
-    print("-" * 60)
-
+    """Main loop - check for reminders periodically."""
+    print(f"Starting reminder sender for user {USER_ID}")
+    print(f"Check interval: {CHECK_INTERVAL_SECONDS}s")
+    print(f"Email config: {SENDER_EMAIL} -> {RECIPIENT_EMAIL}")
+    
+    if not SENDER_EMAIL or not APP_PASSWORD or not RECIPIENT_EMAIL:
+        print("\n⚠ Warning: Email not configured. Reminders will not be sent.")
+        print("Set environment variables:")
+        print("  REMINDER_SENDER_EMAIL")
+        print("  REMINDER_SENDER_APP_PASSWORD")
+        print("  REMINDER_RECIPIENT_EMAIL")
+    
+    print("\nStarting reminder check loop...\n")
+    
     while True:
         try:
             process_reminders()
-            process_medication_reminders()
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            break
         except Exception as e:
-            print(f"Unexpected error in main loop: {e}")
+            print(f"✗ Error: {e}")
         
         time.sleep(CHECK_INTERVAL_SECONDS)
 

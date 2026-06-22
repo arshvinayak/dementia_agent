@@ -12,6 +12,8 @@ frontend/.vite
 data/
 .vite/deps
 
+.env.example
+
 # Distribution / packaging
 .Python
 build/
